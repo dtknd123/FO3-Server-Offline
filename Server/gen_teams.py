@@ -69,11 +69,12 @@ def _hc():
     return m if hasattr(m, "ROLE_WEIGHTS") else __import__("http_config")
 
 
-def team(c, teamid):
+def team(c, teamid, nationality=None):
     hc = _hc()
-    rows = c.execute("""SELECT p.* FROM players p JOIN permid m ON m.spid = p.spid AND m.licensed = 1
-                        WHERE p.teamid = ? ORDER BY (p.spid / 1000000 != ?), (p.spid < 1000000), p.spid""",
-                     (teamid, CURRENT_SEASON)).fetchall()
+    field, value = ("teamid", teamid) if nationality is None else ("nationality", nationality)
+    rows = c.execute(f"""SELECT p.* FROM players p JOIN permid m ON m.spid = p.spid AND m.licensed = 1
+                        WHERE p.{field} = ? ORDER BY (p.spid / 1000000 != ?), (p.spid < 1000000), p.spid""",
+                     (value, CURRENT_SEASON)).fetchall()
     best = {}
     # the club's current-season cards (as on fifaaddict); older seasons (former players, e.g.
     # a 2006 Ronaldinho at Barcelona) and season 0 (engine template cards, ratings 120+, not on

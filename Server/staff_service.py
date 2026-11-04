@@ -73,7 +73,10 @@ def normalize_team(team):
             target['staffid'] = staff['_id']
     active = {r['staffid'] for r in roles if r['staffid']}
     for staff in staffs:
-        staff['status'] = 'appointed' if staff['_id'] in active else 'idle'
+        if staff.get('status') != 'studying':
+            staff['status'] = 'appointed' if staff['_id'] in active else 'idle'
+        if not isinstance(staff.get('study'), dict):
+            staff['study'] = {'history': {}}
     team['staffroles'] = roles
     team['staffroleidx'] = 1
     team['maxstaff'] = max(30, team.get('maxstaff') or 0)
@@ -138,7 +141,7 @@ def appoint(staffid, query, body):
     st = hc._state()
     slot, team = team_state(st)
     staff = next((p for p in team["staffs"] if p["_id"] == staffid), None)
-    if staff is None or staff.get("life", 0) <= 0:
+    if staff is None or staff.get("life", 0) <= 0 or staff.get("status") == "studying":
         return fail("INVALID_STAFF")
     target = next((r for r in team["staffroles"] if r["roleidx"] == role and r["slotidx"] == idx), None)
     if target is None or not target.get("open"):
@@ -172,11 +175,102 @@ def unappoint(staffid, query, body):
     return reply(st, slot)
 
 
+# Offline Study rules: each location targets one existing boost group.
+STUDY = {str(i): {'location': 'LOCATION_NAME_%02d' % i, 'grade': 1,
+                 'position': [t[0] for t in TYPE_LABELS], 'matchcount': 1,
+                 'fee': 1000 if i <= 3 else 2000,
+                 'effectstring': 'Change one bonus within its original option group.' if i <= 3 else 'Improve one bonus by +1 (maximum +5).',
+                 'effectidx': (i - 1) % 3 + 1,
+                 'boosttype': 'change' if i <= 3 else 'enhance'} for i in range(1, 7)}
+STUDY_MAX_FEE = 100000
+
+def study_boost(staff, rule):
+    idx = rule['effectidx']
+    current = next((e for e in staff.get('effect', []) if e.get('effectidx') == idx and e.get('open')), None)
+    if current is None:
+        return None
+    if rule['boosttype'] == 'enhance':
+        if current.get('amount', 0) >= 5:
+            return None
+        return {'effectidx': idx, 'boosttype': 'enhance', 'effect': current['effect'], 'inc': 1}
+    info = CATALOG.get(str(staff.get('stfid')))
+    if info is None:
+        return None
+    choices = [STAT_KEYS[label] for label in info['boost_groups'][idx - 1]
+               if label in STAT_KEYS and STAT_KEYS[label] != current['effect']]
+    if not choices:
+        return None
+    return {'effectidx': idx, 'boosttype': 'change', 'effect': random.choice(choices), 'inc': 0}
+
+def study_start(lid, query, body):
+    rule = STUDY.get(lid)
+    if rule is None:
+        return fail('ITEM_USE_ERROR')
+    req = json.loads(body or b'{}')
+    ids = req.get('staffs')
+    if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str):
+        return fail('INVALID_STAFF')
+    st = hc._state()
+    slot, team = team_state(st)
+    if any(p.get('status') == 'studying' and (p.get('study') or {}).get('lid') == lid for p in team['staffs']):
+        return fail('ITEM_USE_ERROR')
+    staff = next((p for p in team['staffs'] if p['_id'] == ids[0]), None)
+    if staff is None or staff.get('status') != 'idle' or staff.get('material') or staff.get('life', 0) <= 0:
+        return fail('INVALID_STAFF')
+    if staff.get('grade', 0) < rule['grade'] or staff.get('position') not in rule['position']:
+        return fail('INVALID_STAFF')
+    boost = study_boost(staff, rule)
+    if boost is None:
+        return fail('ITEM_USE_ERROR')
+    history = (staff.get('study') or {}).get('history') or {}
+    count = len(history.get(lid, []))
+    fee = min(STUDY_MAX_FEE, rule['fee'] * 2 ** min(count, 16))
+    coach = hc.my_coach(st)
+    if coach.get('ep', hc.START_EP) < fee:
+        return fail('STAFF_EP_NOTENOUGH')
+    coach['ep'] = coach.get('ep', hc.START_EP) - fee
+    staff['status'] = 'studying'
+    staff['study'] = {'lid': lid, 'mcdate': int(team.get('staffsmc') or 0),
+                      'history': history, 'boost': boost}
+    hc._save(st)
+    return reply(st, slot, staffs={staff['_id']: staff})
+
+def study_complete(lid, query, body):
+    rule = STUDY.get(lid)
+    if rule is None:
+        return fail('ITEM_USE_ERROR')
+    st = hc._state()
+    slot, team = team_state(st)
+    staff = next((p for p in team['staffs'] if p.get('status') == 'studying'
+                  and (p.get('study') or {}).get('lid') == lid), None)
+    if staff is None:
+        return fail('INVALID_STAFF')
+    study = staff['study']
+    if int(team.get('staffsmc') or 0) - study['mcdate'] < rule['matchcount']:
+        return fail('ITEM_USE_ERROR')
+    boost = study['boost']
+    effect = next((e for e in staff.get('effect', []) if e.get('effectidx') == boost['effectidx']), None)
+    if effect is None:
+        return fail('INVALID_STAFF')
+    if boost['boosttype'] == 'change':
+        effect['effect'] = boost['effect']
+    else:
+        effect['amount'] = min(5, effect['amount'] + boost['inc'])
+    study['history'].setdefault(lid, []).append(dict(boost))
+    staff['status'] = 'idle'
+    # Keep the result for the client's return popup, while freeing the location.
+    study['lid'] = None
+    hc._save(st)
+    return reply(st, slot, staffs={staff['_id']: staff})
+
+
 def install(module):
     global hc
     hc = module
     hc.ENDPOINTS["/staff/recruit"] = recruit_list
     hc.ROUTES[:0] = [
+        (re.compile(r"/staff/study/(\d+)/complete"), study_complete),
+        (re.compile(r"/staff/study/(\d+)"), study_start),
         (re.compile(r"/staff/recruit/(\d+)"), recruit),
         (re.compile(r"/staff/appoint/([0-9a-f]{24})"), appoint),
         (re.compile(r"/staff/unappoint/([0-9a-f]{24})"), unappoint),

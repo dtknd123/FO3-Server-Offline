@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "admin", "index.html")
 POS_NAMES = "GK SW RWB RB RCB CB LCB LB LWB RDM CDM LDM RM RCM CM LCM LM RAM CAM LAM RF CF LF RW RS ST LS LW".split()
 API = {}
-READ_ONLY = {"summary", "players", "search", "packs", "daily", "log"}  # the rest must be POST + header
+READ_ONLY = {"enhancement_settings", "summary", "players", "search", "packs", "daily", "log"}  # the rest must be POST + header
 hc = None  # the http_config module, set by start() (or by tests)
 
 
@@ -280,6 +280,25 @@ def log(p):
     except OSError:
         lines = []
     return {"lines": [ln.rstrip("\n")[:300] for ln in lines]}
+
+
+@api("enhancement_settings")
+def enhancement_settings_get(p):
+    import enhancement_settings
+    return {"success_percent": enhancement_settings.get_rate()}
+
+
+@api("enhancement_settings_set")
+def enhancement_settings_set(p):
+    import enhancement_settings
+    value = p.get("success_percent")
+    if "success_percent" not in p:
+        raise AdminError("Thiếu tỷ lệ thành công.")
+    try:
+        enhancement_settings.set_rate(value)
+    except ValueError as e:
+        raise AdminError(str(e))
+    return {"success_percent": value}
 
 
 class Admin(http.server.BaseHTTPRequestHandler):

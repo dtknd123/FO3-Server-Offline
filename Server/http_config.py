@@ -209,31 +209,77 @@ def ep_coaches(query, body):
                   "defaultcoachid": st["defaultcoachid"] if st["defaultcoachid"] in usable else ""})
 
 
+def coach_name_valid(st, name):
+    if not isinstance(name, str) or not 2 <= len(name.strip()) <= 12 or any(ord(c) < 32 for c in name):
+        return 'invalid name'
+    if any(c['name'].casefold() == name.strip().casefold() for c in st['coaches']):
+        return 'busy'
+    return None
+
+
+def ep_coach_reserve(query, body):
+    req = json.loads(body or b'{}')
+    st = _state()
+    reason = coach_name_valid(st, req.get('name'))
+    if len(st['coaches']) >= 2:
+        reason = 'busy'
+    return _json({'result': False, 'reason': reason} if reason else {'result': True})
+
+
+def new_manager_team(teamid, chosen=()):
+    import copy
+    team = copy.deepcopy(roster(teamid)['team'])
+    if chosen:
+        chosen = {int(p.get('spid')) if isinstance(p, dict) else int(p) for p in chosen}
+        selected = [p for p in team['players'] if int(p['spid']) in chosen]
+        # Keep the requested cards and supply the bench required by the native client.
+        selected += [p for p in team['players'] if p not in selected][:max(0,18-len(selected))]
+        team['players'] = selected
+    fix_formation(team, teamid)
+    repair_squad(team)
+    return team
+
+
 def ep_new_team(slot, query, body):
-    # POST /coach/<slot>/new/step/3 {"id": teamid, "spids": [...]}: the client passes this
-    # body on as the new club and reads data.team.players ("could not take the random
-    # players!" otherwise). Built from gen_teams.py's roster file for that team.
-    req = json.loads(body or b"{}")
-    chosen = set(req.get("spids", []))
-    team = roster(int(req.get("id") or 0))["team"]
-    team["players"] = [p for p in team["players"] if p["spid"] in chosen]
-    team["squad"]["positions"] = [p for p in team["squad"]["positions"] if p["spid"] in chosen]
-    fix_formation(team, int(req.get("id") or 0))
-    st = _state(); st["teams"][str(slot)] = team; _save(st)
-    return _json({"result": True, "team": team})
+    st = _state()
+    if slot not in (0, 1) or any(c['slot'] == slot for c in st['coaches']):
+        return _json({'result': False, 'reason': 'busy'})
+    req = json.loads(body or b'{}')
+    try:
+        teamid = int(req.get('id') or 0)
+        team = new_manager_team(teamid, req.get('spids') or [])
+    except (ValueError, TypeError):
+        return _json({'result': False, 'reason': 'invalid team'})
+    if len(team['players']) < 18:
+        return _json({'result': False, 'reason': 'invalid team'})
+    st.setdefault('pendingteams', {})[str(slot)] = {'teamid': teamid, 'team': team}
+    _save(st)
+    return _json({'result': True, 'team': owned_team(team)})
 
 
 def ep_create_coach(slot, query, body):
-    # POST /coach/<slot> {"id": teamid, "coachName"}: needs body.result
-    req = json.loads(body or b"{}")
+    req = json.loads(body or b'{}')
     st = _state()
-    purge_deleted_coaches(st)
-    st["coaches"] = [c for c in st["coaches"] if c["slot"] != slot] + [{
-        "_id": coach_id(slot), "slot": slot, "name": req.get("coachName", ""), "state": "active",
-        # StartupCoachCreationScreen.initializeMyCoach reads teamvalue.val, levelinfo.level, summary
-        "teamid": req.get("id"), "teamvalue": {"val": 0}, "levelinfo": {"level": 1}, "summary": {}}]
+    if slot not in (0, 1) or any(c['slot'] == slot for c in st['coaches']):
+        return _json({'result': False, 'reason': 'busy'})
+    name = req.get('coachName')
+    reason = coach_name_valid(st, name)
+    if reason:
+        return _json({'result': False, 'reason': reason})
+    try:
+        teamid = int(req.get('id') or 0)
+        pending = st.get('pendingteams', {}).get(str(slot))
+        team = pending['team'] if pending and pending['teamid'] == teamid else new_manager_team(teamid)
+    except (ValueError, TypeError):
+        return _json({'result': False, 'reason': 'invalid team'})
+    if len(team['players']) < 18:
+        return _json({'result': False, 'reason': 'invalid team'})
+    st['teams'][str(slot)] = team
+    st.setdefault('pendingteams', {}).pop(str(slot), None)
+    st['coaches'].append({'_id': coach_id(slot), 'slot': slot, 'name': name.strip(), 'state': 'active',
+        'teamid': teamid, 'teamvalue': {'val': 0}, 'levelinfo': {'level': 1}, 'summary': {}, 'createdat': w3c(time.time())})
     _save(st)
-    return _json({"result": True})
+    return _json({'result': True})
 
 
 # Deleting a manager (StartupCoachCreationScreen > Delete): PUT /coach/<slot>/postponed puts it in
@@ -343,6 +389,11 @@ def ep_coach_squad(query, body):
     if (sum(p["pos"] < POS_SUB for p in positions) == 11
             and len({p["id"] for p in positions}) == len(positions)
             and len({p["pos"] for p in positions if p["pos"] < POS_SUB}) == 11):
+        squad_presets(team)
+        selected = req.get('presetidx', team.get('presetidx', 0))
+        if type(selected) is not int or not 0 <= selected < 3:
+            return _json({'result': False, 'reason': 'INVALID_SQUAD'})
+        team['presetidx'] = selected
         team["squad"]["positions"] = positions
         for k in ("formation", "workrate"):
             if k in sq:
@@ -351,13 +402,52 @@ def ep_coach_squad(query, body):
             team["squad"]["captain"] = str(req["captain"])
         if req.get("kickers") and all(str(k) in spid_of for k in req["kickers"] if k):
             team["squad"]["kickers"] = [str(k) for k in req["kickers"] if k]
+        squad_presets(team)
         _save(st)
     return _json({"result": True, "resources": coach_me_resources(st, slot)})
+
+
+def ep_team_role(role, query, body):
+    """Native Role tab saves one role at a time, separately from the formation."""
+    if role != 'captain' and role not in ('0', '1', '2', '3', '4'):
+        return _json({'result': False, 'reason': 'INVALID_SQUAD'})
+    req = json.loads(body or b'{}')
+    playerid = req.get('id')
+    if not isinstance(playerid, (str, int)) or isinstance(playerid, bool):
+        return _json({'result': False, 'reason': 'INVALID_SQUAD'})
+    playerid = str(playerid)
+    st = _state()
+    slot = _default_slot(st)
+    team = st['teams'].get(str(slot))
+    if team is None:
+        return _json({'result': False, 'reason': 'INVALID_SQUAD'})
+    repair_squad(team)
+    starters = {p['id'] for p in team['squad']['positions'] if p['pos'] < POS_SUB}
+    if playerid not in starters:
+        return _json({'result': False, 'reason': 'INVALID_SQUAD'})
+    if role == 'captain':
+        team['squad']['captain'] = playerid
+    else:
+        team['squad']['kickers'][int(role)] = playerid
+    team['captain'] = team['squad']['captain']
+    team['kickers'] = list(team['squad']['kickers'])
+    squad_presets(team)
+    _save(st)
+    return _json({'result': True, 'resources': coach_me_resources(st, slot)})
 
 
 def roster(teamid):
     """{summary, team} of a club: the gen_teams.py roster file if there is one, else built
     the same way straight from fifadb (league opponents)."""
+    if teamid in _NATIONAL_TEAMS:
+        with closing(_db()) as c:
+            r = gen_teams.team(c, teamid, nationality=_NATIONAL_TEAMS[teamid])
+        if r is not None:
+            info = _CLUB_TEAMS[teamid]
+            nation = _CLUB_NATIONS[_NATIONAL_TEAMS[teamid]]
+            r["summary"].update(name=info["teamname"], league={"id":78},
+                                nation={"id":nation["nationid"], "name":nation["nationname"]}, rival={"name":""})
+            return r
     f = os.path.join(RESPONSES, f"static_info_authentic_team_all_{teamid}.json")
     if os.path.isfile(f):
         with open(f) as fh:
@@ -454,7 +544,7 @@ def ep_match_campaign(query, body):
 
 def roster_summary(teamid):
     """Static team info (name, league, nation, rival) written by gen_teams.py."""
-    s = roster(teamid).get("summary", {})
+    s = club_summary_response(teamid)["summary"]
     return {k: s[k] for k in ("name", "league", "nation", "rival") if k in s}
 
 
@@ -865,6 +955,27 @@ def repair_squad(team):
                      else (fallback[i % len(fallback)] if fallback else "") for i in range(5)]
 
 
+def squad_presets(team):
+    """Native SquadUtil needs team.teamsquadlist.preset, even on opening the first preset."""
+    import copy
+    stored = team.get('teamsquadlist')
+    entries = stored.get('preset', []) if isinstance(stored, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    active = team.get('presetidx', 0)
+    active = active if type(active) is int and 0 <= active < 3 else 0
+    presets = []
+    for index in range(3):
+        candidate = entries[index] if index < len(entries) and isinstance(entries[index], dict) else team['squad']
+        temp = {'players': team['players'], 'squad': copy.deepcopy(candidate)}
+        repair_squad(temp)
+        presets.append(temp['squad'])
+    presets[active] = copy.deepcopy(team['squad'])
+    team['presetidx'] = active
+    team['teamsquadlist'] = {'preset': presets}
+    return team['teamsquadlist']
+
+
 def owned_team(raw):
     """A stored team ({players:[{spid,...}], squad:{positions,captain,kickers,...}}) in the
     shape the client expects for a club it can show and play with (coach.team, match side.team)."""
@@ -904,7 +1015,8 @@ def owned_team(raw):
                  "staffroleidx": team.get("staffroleidx") or 1,
                  "maxstaff": team.get("maxstaff") or 30, "staffsmc": team.get("staffsmc") or 0})
     # PlayerListUtil.generateCaptainFromCoachInfo (Tim > Formasi) reads these at team level
-    team.update({"captain": sq["captain"], "kickers": sq["kickers"], "presetidx": 0})
+    team.update({"captain": sq["captain"], "kickers": sq["kickers"]})
+    squad_presets(team)
     staff_service.normalize_team(team)
     team.setdefault("formations", [])
     return team
@@ -977,13 +1089,17 @@ def coach_me(st, slot):
         # playlimit {modeid: {playcount}}: Liga's Mulai/Simulasi buttons compare playcount with
         # PLAYLIMIT.maxplay; without the key playcount stays undefined and they stay disabled
         "playlimit": {},
-        "kit": team_kit(teamid), "summary": team_summary(team, teamid),
+        "kit": team_kit(teamid), "summary": dict(team_summary(team, teamid),
+            stadium={"id": int(coach.get('stadiumid') or 1)},
+            appat=coach.get('createdat') or w3c(os.path.getctime(os.path.join(HERE, 'gamedata', 'state.json')))),
+        "stadium": {"id": int(coach.get('stadiumid') or 1)},
+        "career": {"appat": coach.get('createdat') or w3c(os.path.getctime(os.path.join(HERE, 'gamedata', 'state.json')))},
         # cups -> CupProxy.cupPlayList: {metaid, cupid} of cups not left yet (front screen resumes
         # them; an ended one shows its won/eliminated screen with the reward button -> /leave)
         "items": coach_items(st, slot), "matchstats": [], "scouters": coach_scouters(st, slot),
         "cups": [{"metaid": c["metaid"], "cupid": c["_id"]} for c in (st.get("cups") or {}).values()],
         # SquadScreenHandler: formation combobox reads /coach/me?path=formations
-        "formations": team["formations"], "teamsquadlist": [],
+        "formations": team["formations"], "teamsquadlist": team["teamsquadlist"],
     }
 
 
@@ -1015,7 +1131,19 @@ def ep_coach_onready(query, body):
 def ep_default_coach(slot, query, body):
     # PUT /coach/<slot>/default: the client calls setLocalCoachId(body.resources[0].body.id);
     # resources are also fed to cached resources, so /coach/me (CoachProxy) goes first.
-    st = _state(); st["defaultcoachid"] = coach_id(slot)
+    st = _state()
+    if not any(c['slot'] == slot and c.get('state', 'active') == 'active' for c in st['coaches']):
+        return _json({'result': False, 'reason': 'INVALID_COACH'})
+    import copy
+    previous = _default_slot(st)
+    if previous != slot:
+        context_keys = ('league2', 'cups', 'offers', 'match', 'trade', 'cup_pending')
+        contexts = st.setdefault('coachcontexts', {})
+        contexts[str(previous)] = {k: copy.deepcopy(st[k]) for k in context_keys if k in st}
+        for key in context_keys:
+            st.pop(key, None)
+        st.update(copy.deepcopy(contexts.get(str(slot), {})))
+    st['defaultcoachid'] = coach_id(slot)
     daily_login(st)  # first login of the day: today's reward goes to the Bag
     if str(slot) in st["teams"]:
         balance_first_team(st["teams"][str(slot)])
@@ -1080,12 +1208,9 @@ def _db():
 
 
 def league_teams(leagueid, mine):
-    """My club + the strongest clubs of its league in fifadb (base cards, full squads)."""
-    with closing(_db()) as c:
-        rows = c.execute("""SELECT p.teamid FROM players p JOIN permid m ON m.spid = p.spid AND m.licensed = 1
-                            WHERE p.leagueid = ? AND p.spid < 1000000 GROUP BY p.teamid
-                            HAVING COUNT(*) >= 16 ORDER BY MAX(p.overallrating) DESC""", (leagueid,)).fetchall()
-    return [mine] + [r[0] for r in rows if r[0] != mine][:LEAGUE_SIZE - 1]
+    """Use the same valid domestic/national rosters as the team selector."""
+    choices = next((ts for _, leagues in club_index() for lid, ts in leagues if lid == leagueid), [])
+    return [mine] + [tid for tid in choices if tid != mine][:LEAGUE_SIZE - 1]
 
 
 def league_round(teams, rnd):
@@ -1179,8 +1304,29 @@ def l2_resources(st):
     return [{"uri": "/league2/me", "body": l2_me(st)}]
 
 
+def repair_league_context(st):
+    lg = st.get("league2") or {}
+    league = lg.get("league") or {}
+    if not league:
+        return False
+    teamid = my_teamid(st)
+    teams = league.get("teams", [])
+    owner = lg.get("teamid", teams[0] if teams else None)
+    leagueid = roster_summary(teamid).get("league", {}).get("id", 0)
+    if owner == teamid and lg.get("leagueid") == leagueid and teamid in teams:
+        return False
+    # Preserve the previous season rather than relabel its fixtures as a different team.
+    st.setdefault("league2_archives", []).append({"slot": _default_slot(st),
+        "reason": "team_changed", "archivedat": int(time.time()*1000), "season": lg})
+    st["league2"] = {"difficultyselect": lg.get("difficultyselect", 10)}
+    return True
+
+
 def ep_l2_me(query, body):
-    return _json(l2_me(_state()))
+    st = _state()
+    if repair_league_context(st):
+        _save(st)
+    return _json(l2_me(st))
 
 
 def ep_l2_reward(query, body):
@@ -1237,32 +1383,80 @@ def ep_l2_achievement(query, body):
 # club steppers from SORTNATION [nationid], SORTLEAGUE {nationid: [leagueid]} and SORTTEAM
 # {leagueid: [teamid]}; the picked club's squad is /static/info/authentic/team/licensed/<id>
 # ({teamid, summary, team}, built by gen_teams.team like the six recommended clubs).
-CLUB_MIN_PLAYERS = 16  # licensed 2017 cards a club needs to be listed
+CLUB_MIN_PLAYERS = 18
 _CLUBS = []
+with open(os.path.join(HERE, "gamedata", "club_catalog.json"), encoding="utf-8") as _f:
+    _CLUB_CATALOG = json.load(_f)
+_CLUB_TEAMS = {t["teamid"]: t for t in _CLUB_CATALOG["teams"]}
+_CLUB_LEAGUES = {t["leagueid"]: t for t in _CLUB_CATALOG["leagues"]}
+_CLUB_NATIONS = {t["nationid"]: t for t in _CLUB_CATALOG["nations"]}
+_CLUB_LINKS = {t["teamid"]: t["leagueid"] for t in _CLUB_CATALOG["leagueteamlinks"]}
+_NATIONAL_TEAMS = {n["teamid"]: n["nationid"] for n in _CLUB_NATIONS.values()
+                   if n["teamid"] in _CLUB_TEAMS and n["teamid"] > 0}
+_CLUB_LINKS.update({tid: 78 for tid in _NATIONAL_TEAMS})
+
+_CLUB_STADIUMS = {t["stadiumid"]: t for t in _CLUB_CATALOG["stadiums"]}
+_CLUB_STADIUM_LINKS = {t["teamid"]: t["stadiumid"] for t in _CLUB_CATALOG["teamstadiumlinks"]}
+
+
+def club_summary_response(teamid):
+    r = roster(teamid)
+    summary = dict(r["summary"])
+    info = _CLUB_TEAMS.get(teamid, {})
+    leagueid = _CLUB_LINKS.get(teamid, summary.get("league", {}).get("id", 0))
+    league = _CLUB_LEAGUES.get(leagueid, {})
+    nationid = league.get("countryid", 0)
+    # National squads and Rest of World must not inherit the league's placeholder nation.
+    if leagueid == 78:
+        nationid = next((n["nationid"] for n in _CLUB_NATIONS.values() if n["teamid"] == teamid), 0)
+    elif leagueid == 76:
+        nationid = next((n["nationid"] for n in _CLUB_CATALOG.get("rowteamnationlinks", []) if n["teamid"] == teamid), 0)
+    summary.update(id=teamid, teamid=teamid,
+                   name=info.get("teamname") or summary.get("name", ""),
+                   league={"id": leagueid, "name": league.get("leaguename", "")},
+                   nation={"id": nationid, "name": _CLUB_NATIONS.get(nationid, {}).get("nationname", "")},
+                   rival={"name": _CLUB_TEAMS.get(info.get("rivalteam"), {}).get("teamname", "")})
+    stadiumid = _CLUB_STADIUM_LINKS.get(teamid)
+    stadium = _CLUB_STADIUMS.get(stadiumid, {})
+    stadium = {"id": stadiumid or 0, "name": stadium.get("name", "N/A"),
+               "yearbuilt": stadium.get("yearbuilt", "N/A"), "capacity": stadium.get("capacity", "N/A")}
+    return {**summary, "summary": summary, "stadium": stadium, "kit": team_kit(teamid)}
 
 
 def club_index():
-    """[(nationid, [(leagueid, [teamid])])] of clubs with a full 2017 squad, strongest first (by
-    their best eleven); a league's nation is its players' most common nationality."""
+    """Native country/league links; alphabetical clubs and top division first."""
     if not _CLUBS:
         with closing(_db()) as c:
-            rows = c.execute(f"""SELECT p.leagueid, p.teamid, p.nationality, {POSOVR} FROM players p
-                                 JOIN permid m ON m.spid = p.spid AND m.licensed = 1 WHERE p.spid / 1000000 = ?""",
-                             (gen_teams.CURRENT_SEASON,)).fetchall()
-        squads, nats = {}, {}
-        for lid, tid, nat, ovr in rows:
-            squads.setdefault((lid, tid), []).append(ovr)
-            nats.setdefault(lid, collections.Counter())[nat] += 1
-        power = {k: sum(sorted(v)[-11:]) / 11 for k, v in squads.items() if len(v) >= CLUB_MIN_PLAYERS}
+            rows = c.execute("""SELECT p.teamid, COUNT(DISTINCT p.playerid),
+                MAX(p.preferredposition1 = 0) FROM players p
+                JOIN permid m ON m.spid=p.spid AND m.licensed=1
+                WHERE p.spid / 1000000 = ? GROUP BY p.teamid""",
+                (gen_teams.CURRENT_SEASON,)).fetchall()
         leagues = {}
-        for (lid, tid), p in power.items():
-            leagues.setdefault(lid, []).append((p, tid))
-        by_nation = {}
+        for tid, count, goalie in rows:
+            lid = _CLUB_LINKS.get(tid)
+            if count < CLUB_MIN_PLAYERS or not goalie or lid not in _CLUB_LEAGUES or lid in (76, 78, 2028):
+                continue
+            leagues.setdefault(lid, []).append(tid)
+        nations = {}
         for lid, teams in leagues.items():
-            teams.sort(reverse=True)
-            by_nation.setdefault(nats[lid].most_common(1)[0][0], []).append((teams[0][0], lid, [t for _, t in teams]))
-        _CLUBS.extend((n, [(lid, ts) for _, lid, ts in sorted(ls, reverse=True)])
-                      for n, ls in sorted(by_nation.items(), key=lambda kv: -max(l[0] for l in kv[1])))
+            nation = _CLUB_LEAGUES[lid]["countryid"]
+            teams.sort(key=lambda tid: (_CLUB_TEAMS[tid]["teamname"].casefold(), tid))
+            nations.setdefault(nation, []).append((lid, teams))
+        # International is a dedicated category, never mixed with domestic leagues.
+        with closing(_db()) as c:
+            counts = {n:(total,goalie) for n,total,goalie in c.execute("""
+                SELECT p.nationality, COUNT(DISTINCT p.playerid), MAX(p.preferredposition1=0)
+                FROM players p JOIN permid m ON m.spid=p.spid AND m.licensed=1
+                WHERE p.spid / 1000000 = ? GROUP BY p.nationality""",
+                (gen_teams.CURRENT_SEASON,))}
+        internationals = [tid for tid,n in _NATIONAL_TEAMS.items()
+                          if counts.get(n,(0,0))[0]>=CLUB_MIN_PLAYERS and counts[n][1]]
+        if internationals:
+            nations[75] = [(78, sorted(internationals, key=lambda tid:_CLUB_TEAMS[tid]["teamname"].casefold()))]
+        for nation in sorted(nations, key=lambda n: _CLUB_NATIONS.get(n, {}).get("nationname", "")):
+            ls = sorted(nations[nation], key=lambda x: (_CLUB_LEAGUES[x[0]]["level"], x[0]))
+            _CLUBS.append((nation, ls))
     return _CLUBS
 
 
@@ -1275,15 +1469,7 @@ def ep_sortleague(query, body):
 
 
 def ep_sortteam(query, body):
-    """/static/db/SORTTEAM {leagueid: [teamid]}: the club picker above; Liga's creation screen
-    counts my own league's clubs (the ones its calendar will use)."""
-    st = _state()
-    out = {str(lid): ts for _, ls in club_index() for lid, ts in ls}
-    if st["coaches"]:
-        teamid = my_teamid(st)
-        lid = roster_summary(teamid).get("league", {}).get("id", 0)
-        out[str(lid)] = league_teams(lid, teamid)
-    return _json(out)
+    return _json({str(lid): ts for _, ls in club_index() for lid, ts in ls})
 
 
 def ep_authentic_team(kind, teamid, query, body):
@@ -1294,7 +1480,7 @@ def ep_authentic_team(kind, teamid, query, body):
     r = roster(int(teamid))
     team = dict(r["team"], players=[dict(p, id=str(p["spid"])) for p in r["team"]["players"]])
     team["captain"] = str(team["squad"].get("captain") or "")
-    return _json({**r, "team": team, "teamid": int(teamid), "kit": team_kit(int(teamid))})
+    return _json({**r, **club_summary_response(int(teamid)), "team": team, "teamid": int(teamid)})
 
 
 def ep_l2_calendar(query, body):
@@ -1304,7 +1490,7 @@ def ep_l2_calendar(query, body):
     lid = roster_summary(teamid).get("league", {}).get("id", 0)
     teams = league_teams(lid, teamid)
     day = int(time.time() // 86400 * 86400 * 1000)  # today 00:00 UTC, ms
-    st["league2"] = {"leagueid": lid, "difficultyselect": int(req.get("difficulty") or 10),
+    st["league2"] = {"teamid": teamid, "leagueid": lid, "difficultyselect": int(req.get("difficulty") or 10),
                      "sponsor": req.get("sponsor"), "laststatus": "opening", "openingday": day,
                      "sponsoroffice": {"season": {"status": "started"}},
                      "league": {"teams": teams, "maxround": 2 * (len(teams) - 1) - 1, "nextround": 0,
@@ -1364,6 +1550,12 @@ def ep_l2_match(query, body, sim=False):
     st = _state(); lg = st.get("league2")
     if not lg or not lg.get("league"):
         return _json({"result": False, "reason": "LEAGUE_FAIL"})
+    ticket = None
+    if sim:
+        coach = my_coach(st)
+        ticket = next((item for item in coach.get('items', []) if item['itemid'] == 2001 and item.get('remains', 0) > 0), None)
+        if ticket is None:
+            return _json({'result': False, 'reason': 'ITEM_USE_ERROR'})
     match = league_match_body(st, req, req.get("playtype"))
     st["match"] = match
     lg["pending"] = {"id": match["id"], "round": req.get("round", 0), "home": req["home"], "away": req["away"]}
@@ -1374,8 +1566,13 @@ def ep_l2_match(query, body, sim=False):
         match.update(stage="closed", simulated=True)
         match["gamesettings"]["simulated"] = True
         out.update(leagueparam=param, eventlist=[], score=mine and mine["goals"])
+        ticket['remains'] -= 1
+        if ticket['remains'] == 0:
+            coach['items'].remove(ticket)
     _save(st)
     out["resources"] = [{"uri": f"/match/{match['id']}", "body": match}] + (l2_resources(st) if sim else [])
+    if sim:
+        out['resources'] += coach_me_resources(st, _default_slot(st))
     return _json(out)
 
 
@@ -1570,6 +1767,7 @@ def match_reward(st, stats):
     reward = lambda n: {"total": n, "detail": {"base": n, "extra": 0}}
     prev, cur = gain_exp(my_coach(st), cexp, coach_need, COACH_MAX_LEVEL)
     team, done, players = st["teams"].get(str(_default_slot(st))) or {"players": []}, set(), []
+    team['staffsmc'] = int(team.get('staffsmc') or 0) + 1
     for s in (stats.get(me) or {}).get("players") or []:
         pid = int(s.get("spid") or 0) % 1000000
         mine = [p for p in team["players"] if int(p["spid"]) % 1000000 == pid and iid(p) not in done]
@@ -2085,6 +2283,14 @@ def enhance_pair(team, a, b):
 
 
 def enhance_rate(target, material):
+    import enhancement_settings
+    override = enhancement_settings.get_rate()
+    if override is not None:
+        return override / 100.0
+    return default_enhance_rate(target, material)
+
+
+def default_enhance_rate(target, material):
     """Base chance by target grade times the bonus the Upgrade tab shows as "Rasio bonus
     keberhasilan" (TeamManagementPlayerEnhancementOldTabPage.updatePreviewText): material +1 or
     lower = Kosong, at least 2/3 of the target grade = High, at least 1/3 = Normal, else Low.
@@ -2597,6 +2803,25 @@ ITEMS = {  # itemid: (name, icon, type, effect, description)
     3002: ("Ganti nama manager", 3002, "COACHNAME_CHANGE", {}, "Ganti nama manager Anda."),
     3001: ("Ganti tim", 3001, "TEAM_CHANGE", {}, "Pindah ke klub lain (logo, seragam, liga); pemain tetap."),
 }
+# Player EXP capsules use the client's native player selection screen.
+ITEMS.update({
+    910001: ('Player EXP +1,000', 300, 'PLAYER_EXP_CAPSULE', {'exp': 1000},
+             'Add 1,000 EXP to one owned player. Maximum level: 23.'),
+    910002: ('Player EXP +5,000', 300, 'PLAYER_EXP_CAPSULE', {'exp': 5000},
+             'Add 5,000 EXP to one owned player. Maximum level: 23.'),
+    910003: ('Player EXP +30,000', 300, 'PLAYER_EXP_CAPSULE', {'exp': 30000},
+             'Add 30,000 EXP to one owned player. Maximum level: 23.'),
+})
+# Additional consumables supported by the native inventory screens.
+ITEMS.update({
+    910004: ('Player EXP +2,000', 300, 'PLAYER_EXP_CAPSULE', {'exp': 2000}, 'Add 2,000 player EXP. Maximum level: 23.'),
+    910005: ('Player EXP +10,000', 300, 'PLAYER_EXP_CAPSULE', {'exp': 10000}, 'Add 10,000 player EXP. Maximum level: 23.'),
+    910006: ('Player EXP +20,000', 300, 'PLAYER_EXP_CAPSULE', {'exp': 20000}, 'Add 20,000 player EXP. Maximum level: 23.'),
+    911001: ('Coach EXP +1,000', 200, 'COACH_EXP_CAPSULE', {'exp': 1000}, 'Add 1,000 manager EXP. Maximum level: 100.'),
+    911002: ('Coach EXP +5,000', 200, 'COACH_EXP_CAPSULE', {'exp': 5000}, 'Add 5,000 manager EXP. Maximum level: 100.'),
+    911003: ('Coach EXP +30,000', 200, 'COACH_EXP_CAPSULE', {'exp': 30000}, 'Add 30,000 manager EXP. Maximum level: 100.'),
+})
+ITEMS[2001] = ('Simulation Ticket', 2001, 'LEAGUE_SIMULATION', {}, 'One ticket for one simulated league match. Used automatically in League.')
 PACKAGES = {  # itemid: (name, icon, [(itemid, count)], description); bought = contents to Item saya
     801: ("Paket Starter", 801, [(28006, 1), (28007, 1), (28008, 1), (28009, 1), (50020, 2)],
           "Pak FW/MF/DF/GK 60+ dan 2x EP +500.000."),
@@ -2615,6 +2840,17 @@ PACKAGES.update({  # Serial product steps (CHAINED below), bought in order
     70000001: ("Paket Berantai 1/3", 200130000, [(501, 3), (28007, 1)], "Tahap 1: 3x Lucky EP dan pak MF 60+."),
     70000002: ("Paket Berantai 2/3", 200130001, [(50122, 1), (50021, 1)], "Tahap 2: Kotak Emas dan EP +1.000.000."),
     70000003: ("Paket Berantai 3/3", "ID50121GP", [(50121, 1), (8334, 1)], "Tahap 3: Kotak Platinum dan World Best 5."),
+})
+PACKAGES.update({
+    912001: ('Player EXP Bundle', 300, [(910001, 5), (910002, 3), (910003, 1)],
+             '5x Player EXP +1,000, 3x +5,000 and 1x +30,000.'),
+    912002: ('Coach EXP Bundle', 200, [(911001, 5), (911002, 3), (911003, 1)],
+             '5x Coach EXP +1,000, 3x +5,000 and 1x +30,000.'),
+})
+PACKAGES.update({
+    913001: ('Simulation Tickets x10', 2001, [(2001, 10)], '10 league simulation tickets.'),
+    913002: ('Simulation Tickets x50', 2001, [(2001, 50)], '50 league simulation tickets.'),
+    913003: ('Simulation Tickets x100', 2001, [(2001, 100)], '100 league simulation tickets.'),
 })
 MP_SHOP = (501, 50123, 50122, 45013, 45006, 3002)  # MP Shop (shopcategory MILEAGE) copies
 MP_SHOPID = 900_000_000  # MP Shop entries: shopid = MP_SHOPID + itemid (productid stays itemid)
@@ -2644,6 +2880,8 @@ def use_item_def(itemid):
     name, icon, typ, eff, desc = ITEMS[itemid]
     return {"itemid": itemid, "productid": itemid, "name": name, "category": "USE", "type": typ, "unit": "COUNT",
             "itemicon": icon, "bundleicon": icon, "currency": "ep", "stackable": True, "description": desc,
+            **({'capsuleexp': eff['exp'], 'capsuleseason': None, 'capsulelv': None}
+               if typ == 'PLAYER_EXP_CAPSULE' else {}),
             # TeamManagementEPCardScreen.onQuery sizes the coin counter from count.max
             **({"count": {"min": eff["ep"][0], "max": eff["ep"][1]}} if "ep" in eff else {}),
             "bunches": [{"bunch": n, "price": 0} for n in PACK_BUNCHES]}
@@ -2922,7 +3160,30 @@ def use_item(st, slot, coach, it, req):
     """/item/<_id>/use for a USE item (see ITEMS): its effect, one used up."""
     _, _, typ, eff, _ = ITEMS[it["itemid"]]
     out = {"result": True}
-    if typ == "EP_LOTTERY":  # lower amounts more likely
+    consume = 1
+    if typ == 'LEAGUE_SIMULATION':
+        return {'result': False, 'reason': 'ITEM_USE_ERROR'}
+    if typ == 'COACH_EXP_CAPSULE':
+        count = req.get('count', 1)
+        if type(count) is not int or count < 1 or count > it['remains']:
+            return {'result': False, 'reason': 'ITEM_USE_ERROR'}
+        if coach_levelinfo(coach)['level'] >= COACH_MAX_LEVEL:
+            return {'result': False, 'reason': 'ITEM_USE_ERROR'}
+        # Stop at max level without spending additional unused capsules.
+        consume = 0
+        while consume < count and coach_levelinfo(coach)['level'] < COACH_MAX_LEVEL:
+            gain_exp(coach, eff['exp'], coach_need, COACH_MAX_LEVEL)
+            consume += 1
+        out['exp'] = eff['exp'] * consume
+    elif typ == 'PLAYER_EXP_CAPSULE':
+        targetid = req.get('targetid')
+        player = next((p for p in st['teams'][str(slot)]['players']
+                       if isinstance(targetid, str) and iid(p) == targetid), None)
+        if player is None or player_levelinfo(player)['level'] >= PLAYER_MAX_LEVEL:
+            return {'result': False, 'reason': 'ITEM_USE_ERROR'}
+        before, after = gain_exp(player, eff['exp'], player_need, PLAYER_MAX_LEVEL)
+        out.update({'targetid': iid(player), 'before': before, 'after': after})
+    elif typ == "EP_LOTTERY":  # lower amounts more likely
         lo, hi = eff["ep"]
         out["ep"] = lo if lo == hi else max(lo, round(random.triangular(lo, hi, lo), -4))
         add_ep(st, out["ep"])
@@ -2944,7 +3205,8 @@ def use_item(st, slot, coach, it, req):
         if not roster(teamid)["team"]["players"]:
             return {"result": False, "reason": "ITEM_USE_ERROR"}
         coach["teamid"] = teamid
-    it["remains"] -= 1
+        repair_league_context(st)
+    it["remains"] -= consume
     if not it["remains"]:
         coach["items"].remove(it)
     return out
@@ -3103,7 +3365,7 @@ ROUTES = [
     (re.compile(r"/coach/(\w+)/postponed"), ep_coach_postponed),
     (re.compile(r"/static/info/authentic/team/(licensed|all)/(\d+)"), ep_authentic_team),
     # Ganti tim screen: a club's summary for its TeamInfoNew (name/crest id, ovr, teamgrade)
-    (re.compile(r"/static/info/team/summary/(\d+)"), lambda t, q, b: _json({**roster(int(t))["summary"], "id": int(t)})),
+    (re.compile(r"/static/info/team/summary/(\d+)"), lambda t, q, b: _json(club_summary_response(int(t)))),
     (re.compile(r"/player/(\w+)/move/(firstteam|secondteam)"), ep_player_move),
     (re.compile(r"/player/(\w+)/enhance/(\w+)/preview"), ep_enhance_preview),
     (re.compile(r"/player/(\w+)/enhance/(\w+)(?:/(-?\w+)/(-?\w+))?"), ep_enhance),
@@ -3258,6 +3520,13 @@ class H(http.server.BaseHTTPRequestHandler):
         pass  # we do our own logging
 
 
+# Offline overview stadium metadata (unknown real details are shown explicitly).
+ENDPOINTS['/static/stadium/1'] = lambda q,b: _json({'id':1, 'name':'Offline Stadium', 'yearbuilt':'N/A', 'capacity':'N/A'})
+ENDPOINTS['/stadium/1'] = ENDPOINTS['/static/stadium/1']
+ENDPOINTS['/coach/new/reserve'] = ep_coach_reserve
+ENDPOINTS['/game/my/team/captain'] = lambda q,b: ep_team_role('captain', q, b)
+ROUTES.insert(0, (re.compile(r'/game/my/team/kickers/(\d+)'), ep_team_role))
+ENDPOINTS['/shop/products/2001'] = lambda q,b: _json([shop_entry(2001, 'USE')])
 import browser_links
 import staff_service
 staff_service.install(sys.modules[__name__])

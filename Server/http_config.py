@@ -1565,6 +1565,19 @@ def ep_l2_match(query, body, sim=False):
         mine = next((m for m in param["leaguematches"] if my_teamid(st) in (m["home"], m["away"])), None)
         match.update(stage="closed", simulated=True)
         match["gamesettings"]["simulated"] = True
+        if mine:
+            # MatchResult reads the match resource, so keep the simulated fixture score here.
+            home_goals = int(mine["goals"]["home"])
+            away_goals = int(mine["goals"]["away"])
+            match["gamesettings"]["prevScore"] = {"home": home_goals, "away": away_goals}
+            is_home = req["home"] == my_teamid(st)
+            match["result"] = {
+                "home": {"id": req["home"], "score": home_goals, "players": []},
+                "away": {"id": req["away"], "score": away_goals, "players": []},
+                "myTeam": "home" if is_home else "away",
+                "opponentTeam": "away" if is_home else "home",
+                "motm": None,
+            }
         out.update(leagueparam=param, eventlist=[], score=mine and mine["goals"])
         ticket['remains'] -= 1
         if ticket['remains'] == 0:

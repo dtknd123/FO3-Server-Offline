@@ -112,6 +112,16 @@
     <div class="status" id="status" role="status" aria-live="polite">Changes are saved immediately on the server; the game reflects them after relaunch or reloading the club screen.</div>
 
     <section id="ringkasan">
+      <div class="card" style="padding:18px;margin-bottom:16px">
+        <h2>Tỷ lệ đập thẻ</h2>
+        <p id="enhanceStatus">Đang tải thiết lập…</p>
+        <label for="enhanceRate">Tỷ lệ thành công: <strong id="enhanceValue">50%</strong></label>
+        <input id="enhanceRate" type="range" min="1" max="100" step="1" value="50" style="width:100%;margin:16px 0">
+        <button id="enhanceSave" class="b primary">Lưu tỷ lệ</button>
+        <button id="enhanceDefault" class="b">Dùng tỷ lệ gốc</button>
+        <p class="muted">Áp dụng cho các lần đập tiếp theo của mọi HLV. Không thay đổi thẻ đã có hoặc dữ liệu profile.</p>
+      </div>
+
       <h2>Club Overview</h2>
       <p class="lead">Current account and club status on the server.</p>
       <dl class="facts" id="facts"></dl>
@@ -397,6 +407,21 @@ packsReady = api("packs").then(j => {
   $("#packSel").innerHTML = packOpts();
   $("#bagPack").innerHTML = '<option value="">No pack</option>' + packOpts();
 }).catch(e => say("Failed to load packs list: " + e.message, "err"));
+
+function renderEnhance(j) {
+  const rate = j.success_percent;
+  $("#enhanceRate").value = rate === null ? 50 : rate;
+  $("#enhanceValue").textContent = $("#enhanceRate").value + "%";
+  $("#enhanceStatus").textContent = rate === null ? "Đang dùng tỷ lệ gốc theo cấp thẻ và nguyên liệu." : "Đang áp dụng tỷ lệ thành công: " + rate + "%";
+}
+$("#enhanceRate").addEventListener("input", () => { $("#enhanceValue").textContent = $("#enhanceRate").value + "%"; });
+$("#enhanceSave").addEventListener("click", () => act(async () => {
+  renderEnhance(await api("enhancement_settings_set", {success_percent: Number($("#enhanceRate").value)}));
+}, "Đã lưu tỷ lệ đập thẻ."));
+$("#enhanceDefault").addEventListener("click", () => act(async () => {
+  renderEnhance(await api("enhancement_settings_set", {success_percent: null}));
+}, "Đã khôi phục tỷ lệ gốc."));
+api("enhancement_settings").then(renderEnhance).catch(e => { $("#enhanceStatus").textContent = e.message; });
 show("ringkasan");
 </script>
 </body>
